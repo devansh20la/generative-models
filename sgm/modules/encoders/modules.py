@@ -2,6 +2,7 @@ import math
 from contextlib import nullcontext
 from functools import partial
 from typing import Dict, List, Optional, Tuple, Union
+import re 
 
 import kornia
 import numpy as np
@@ -396,6 +397,83 @@ class FrozenCLIPEmbedder(AbstractEmbModel):
     def encode(self, text):
         return self(text)
 
+    def add_to_tokenizer(self, placeholder_tokens, initializer_tokens):
+        """
+            Function to add special token and its corresponding embeddings
+            to the tokenizer.
+        """
+        self.orig_embeddings = self.transformer.get_input_embeddings().weight.data.detach().clone()
+        placeholder_token_ids = []
+        for token, init_token in zip(placeholder_tokens, initializer_tokens):
+            num_added_tokens = self.tokenizer.add_tokens(token)
+            if num_added_tokens == 0:
+                raise ValueError(
+                    f"The tokenizer already contains the token {token}. Please pass a different"
+                    " `placeholder_token` that is not already in the tokenizer."
+                )
+
+            placeholder_token_id = self.tokenizer.convert_tokens_to_ids(token)
+            placeholder_token_ids.append(placeholder_token_id)
+            
+            self.transformer.resize_token_embeddings(len(self.tokenizer))
+
+            token_embeds = self.transformer.get_input_embeddings().weight.data
+
+            if init_token.startswith("<rand"):
+                # <rand-"sigma">, e.g. <rand-0.5>
+                sigma_val = float(re.findall(r"<rand-(.*)>", init_token)[0])
+
+                token_embeds[placeholder_token_id] = (
+                    torch.randn_like(token_embeds[0]) * sigma_val
+                )
+                print(
+                    f"Initialized {token} with random noise (sigma={sigma_val}), empirically {token_embeds[placeholder_token_id].mean().item():.3f} +- {token_embeds[placeholder_token_id].std().item():.3f}"
+                )
+                print(f"Norm : {token_embeds[placeholder_token_id].norm():.4f}")
+            elif init_token == "<zero>":
+                token_embeds[placeholder_token_id] = torch.zeros_like(token_embeds[0])
+            else:
+                token_ids = self.tokenizer.encode(init_token, add_special_tokens=False)
+                # Check if initializer_token is a single token or a sequence of tokens
+                if len(token_ids) > 1:
+                    raise ValueError("The initializer token must be a single token.")
+
+                initializer_token_id = token_ids[0]
+                token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]
+
+        self.index_to_update = ~(torch.arange(self.transformer.get_input_embeddings().weight.data.shape[0]) != -1)
+        for token_id in placeholder_token_ids:
+            self.index_to_update[token_id] = True
+        self.transformer.get_input_embeddings().weight.data.requires_grad = True
+
+    def reset_token_embeddings(self, lr=0.0, clip_decay=True):
+        if self.orig_embeddings.device != self.transformer.get_input_embeddings().weight.data.device:
+            self.orig_embeddings = self.orig_embeddings.to(self.transformer.get_input_embeddings().weight.data.device)
+        self.transformer.get_input_embeddings().weight.data[~self.index_to_update] = self.orig_embeddings
+
+        if clip_decay:
+            # clip_ti_decay
+            pre_norm = (
+                self.transformer.get_input_embeddings()
+                .weight[self.index_to_update, :]
+                .norm(dim=-1, keepdim=True)
+            )
+
+            lambda_ = min(1.0, 100 * lr)
+            self.transformer.get_input_embeddings().weight[
+                self.index_to_update
+            ] = torch.nn.functional.normalize(
+                self.transformer.get_input_embeddings().weight[
+                    self.index_to_update, :
+                ],
+                dim=-1,
+            ) * (
+                pre_norm + lambda_ * (0.4 - pre_norm)
+            )
+            return pre_norm
+        else:
+            return 0
+
 
 class FrozenOpenCLIPEmbedder2(AbstractEmbModel):
     """
@@ -417,6 +495,7 @@ class FrozenOpenCLIPEmbedder2(AbstractEmbModel):
     ):
         super().__init__()
         assert layer in self.LAYERS
+        self.tokenizer = open_clip.get_tokenizer(arch)
         model, _, _ = open_clip.create_model_and_transforms(
             arch,
             device=torch.device("cpu"),
@@ -446,7 +525,7 @@ class FrozenOpenCLIPEmbedder2(AbstractEmbModel):
 
     @autocast
     def forward(self, text):
-        tokens = open_clip.tokenize(text)
+        tokens = self.tokenizer(text)
         z = self.encode_with_transformer(tokens.to(self.device))
         if not self.return_pooled and self.legacy:
             return z
@@ -498,6 +577,98 @@ class FrozenOpenCLIPEmbedder2(AbstractEmbModel):
     def encode(self, text):
         return self(text)
 
+    def add_to_tokenizer(self, placeholder_tokens, initializer_tokens):
+        """
+            Function to add special token and its corresponding embeddings
+            to the tokenizer.
+        """
+        check1 = self.model.token_embedding(self.tokenizer("hello world"))
+
+        for token in placeholder_tokens:
+            if token in self.tokenizer.encoder:
+                raise ValueError(
+                    f"The tokenizer already contains the token {token}. Please pass a different"
+                    " `placeholder_token` that is not already in the tokenizer."
+                )
+        self.tokenizer = open_clip.SimpleTokenizer(
+            context_length=self.tokenizer.context_length,
+            additional_special_tokens=placeholder_tokens,
+        )
+
+        old_embeddings = self.model.token_embedding
+        new_embeddings = torch.nn.Embedding(
+            len(self.tokenizer.encoder), 
+            self.model.token_embedding.embedding_dim,
+            device=old_embeddings.weight.device
+        )
+        new_embeddings.weight.data[:old_embeddings.weight.shape[0],:] = old_embeddings.weight.data.clone()
+
+        for token, init_token in zip(placeholder_tokens, initializer_tokens):
+            token_id = self.tokenizer.encode("".join(token))
+
+            if init_token.startswith("<rand"):
+                # <rand-"sigma">, e.g. <rand-0.5>
+                sigma_val = float(re.findall(r"<rand-(.*)>", init_token)[0])
+
+                new_embeddings.weight.data[token_id] = (
+                    torch.randn_like(new_embeddings.weight.data[0]) * sigma_val
+                    )
+                print(
+                    f"Initialized {token} with random noise (sigma={sigma_val}), empirically {new_embeddings.weight.data[token_id].mean().item():.3f} +- {new_embeddings.weight.data[token_id].std().item():.3f}"
+                )
+                print(f"Norm : {new_embeddings.weight.data[token_id].norm():.4f}")
+            elif init_token == "<zero>":
+                new_embeddings.weight.data[token_id] = torch.zeros_like(new_embeddings  [0])
+            else:
+                token_ids = self.tokenizer.encode(init_token)
+                # Check if initializer_token is a single token or a sequence of tokens
+                if len(token_ids) > 1:
+                    raise ValueError("The initializer token must be a single token.")
+
+                initializer_token_id = token_ids[0]
+                new_embeddings.weight.data[token_id] = new_embeddings.weight.data[initializer_token_id]
+        
+        # replace old token embeddings
+        self.old_embeddings = self.model.token_embedding.weight.data.clone()
+        self.index_to_update = ~(torch.arange(new_embeddings.weight.data.shape[0]) != -1)
+        for token in placeholder_tokens:
+            token_id = self.tokenizer.encode("".join(token))[0]
+            self.index_to_update[token_id] = True
+            
+        self.model.token_embedding = new_embeddings
+        self.model.token_embedding.weight.data.requires_grad = True
+
+        check2 = self.model.token_embedding(self.tokenizer("hello world"))
+
+        assert torch.equal(check1, check2), "Embeddings have not been correctly replaced."
+
+    def reset_token_embeddings(self, lr=0.0, clip_decay=True):
+        if self.old_embeddings.device != self.model.token_embedding.weight.data.device:
+            self.old_embeddings = self.old_embeddings.to(self.model.token_embedding.weight.data.device)
+        self.model.token_embedding.weight.data[~self.index_to_update] = self.old_embeddings
+
+        if clip_decay:# clip_ti_decay
+            pre_norm = (
+                self.model.token_embedding
+                .weight[self.index_to_update, :]
+                .norm(dim=-1, keepdim=True)
+            )
+
+            lambda_ = min(1.0, 100 * lr)
+            self.model.token_embedding.weight[
+                self.index_to_update
+            ] = torch.nn.functional.normalize(
+                self.model.token_embedding.weight[
+                    self.index_to_update, :
+                ],
+                dim=-1,
+            ) * (
+                pre_norm + lambda_ * (0.4 - pre_norm)
+            )
+            return pre_norm
+        else:
+            return 0
+    
 
 class FrozenOpenCLIPEmbedder(AbstractEmbModel):
     LAYERS = [

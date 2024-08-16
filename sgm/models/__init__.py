@@ -1,2 +1,2 @@
 from .autoencoder import AutoencodingEngine
-from .diffusion import DiffusionEngine
+from .diffusion import DiffusionEngine, LoraDiffusionEngine
